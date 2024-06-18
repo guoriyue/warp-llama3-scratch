@@ -1,0 +1,4 @@
+Meta-Llama-3-8B/
+__pycache__/
+*.pyc
+results/
