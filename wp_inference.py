@@ -12,42 +12,23 @@ import time
 import argparse
 import contextlib
 from utils import WarpProfilingManager
+import tempfile
+import os
+
+os.environ["TMPDIR"] = "/home/mingfeig/tmp"
+tempfile.tempdir = "/home/mingfeig/tmp"
 
 parser = argparse.ArgumentParser(description="Optional profiling.")
 parser.add_argument('--profile', action='store_true', help="Enable profiling.")
+parser.add_argument('--profile_iter', type=int, default=100, help="Number of iterations to profile.")
+parser.add_argument('--compile', action='store_true', help="Use torch.compile for optimization.")
+parser.add_argument('--tile', action='store_true', help="Use tiling for optimization.")
 args = parser.parse_args()
 
-pm = WarpProfilingManager(args.profile) 
-t1 = time.time()
-with pm.wp_profile_function("Warp Inference"):
-    tokenizer_path = "Meta-Llama-3-8B/tokenizer.model"
-    special_tokens = [
-                "<|begin_of_text|>",
-                "<|end_of_text|>",
-                "<|reserved_special_token_0|>",
-                "<|reserved_special_token_1|>",
-                "<|reserved_special_token_2|>",
-                "<|reserved_special_token_3|>",
-                "<|start_header_id|>",
-                "<|end_header_id|>",
-                "<|reserved_special_token_4|>",
-                "<|eot_id|>",  # end of turn
-            ] + [f"<|reserved_special_token_{i}|>" for i in range(5, 256 - 5)]
+pm = WarpProfilingManager(args.profile)
 
-    mergeable_ranks = load_tiktoken_bpe(tokenizer_path)
-    tokenizer = tiktoken.Encoding(
-        name=Path(tokenizer_path).name,
-        pat_str=r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
-        mergeable_ranks=mergeable_ranks,
-        special_tokens={token: len(mergeable_ranks) + i for i, token in enumerate(special_tokens)},
-    )
-
-    model = torch.load("Meta-Llama-3-8B/consolidated.00.pth")
-    model = {k: wp.array(v.to(torch.float32), dtype=WP_FLOAT32) for k, v in model.items()}
-
-    with open("Meta-Llama-3-8B/params.json", "r") as f:
-        config = json.load(f)
-
+# Define the full model inference function
+def run_wp_inference(tokens, model, config):
     dim = config["dim"]
     n_layers = config["n_layers"]
     n_heads = config["n_heads"]
@@ -57,11 +38,6 @@ with pm.wp_profile_function("Warp Inference"):
     ffn_dim_multiplier = config["ffn_dim_multiplier"]
     norm_eps = config["norm_eps"]
     rope_theta = WP_FLOAT32(config["rope_theta"])
-
-    prompt = "the answer to the ultimate question of life, the universe, and everything is "
-    tokens_ = [128000] + tokenizer.encode(prompt)
-    tokens_ = torch.tensor(tokens_, dtype=torch.int32)
-    tokens = wp.from_torch(tokens_.to(DEVICE), dtype=WP_INT)
     
     with pm.wp_profile_function("Embedding Layer"):
         embedding_layer_weight = model["tok_embeddings.weight"]
@@ -78,8 +54,12 @@ with pm.wp_profile_function("Warp Inference"):
         freqs = wp.zeros(shape=zero_to_one_split_into_64_parts.shape, dtype=WP_FLOAT32)
         wp.launch(kernel=wpm.wp_compute_freqs, dim=zero_to_one_split_into_64_parts.shape[0], inputs=[rope_theta, zero_to_one_split_into_64_parts, freqs])
 
-        freqs_for_each_token = wp.zeros(shape=(17, freqs.shape[0]), dtype=WP_FLOAT32)
-        wp.launch(kernel=wpm.wp_outer_1d_1d_2d, dim=freqs_for_each_token.shape, inputs=[wp.array(data=np.arange(17), dtype=WP_FLOAT32), freqs, freqs_for_each_token])
+        # Use the exact token length for the frequency arrays
+        seq_len = tokens.shape[0]
+        
+        freqs_for_each_token = wp.zeros(shape=(seq_len, freqs.shape[0]), dtype=WP_FLOAT32)
+        wp.launch(kernel=wpm.wp_outer_1d_1d_2d, dim=freqs_for_each_token.shape, 
+                 inputs=[wp.array(data=np.arange(seq_len), dtype=WP_FLOAT32), freqs, freqs_for_each_token])
 
         freqs_cis = wp.array(shape=(freqs_for_each_token.shape[0], freqs_for_each_token.shape[1], 2), dtype=WP_FLOAT32)
         wp.launch(kernel=wpm.wp_polar, dim=freqs_for_each_token.shape, inputs=[freqs_for_each_token, freqs_cis])
@@ -96,9 +76,11 @@ with pm.wp_profile_function("Warp Inference"):
         with pm.wp_profile_function(f"Layer {layer}"):
             qkv_attention_store_ = []
             stacked_qkv_attention = wp.zeros(shape=(tokens.shape[0], v_layer0[0].shape[0] * n_heads), dtype=WP_FLOAT32)
-
-            layer_embedding_norm = wp.zeros(shape=(final_embedding.shape[0], final_embedding.shape[1]), dtype=WP_FLOAT32)
-            wp.launch(kernel=wpm.wp_rms_norm, dim=final_embedding.shape[0], inputs=[final_embedding, WP_FLOAT32(norm_eps), model[f"layers.{layer}.attention_norm.weight"], layer_embedding_norm])
+            if args.tile:
+                layer_embedding_norm = wpm.tiled_rms_norm(final_embedding, WP_FLOAT32(norm_eps), model[f"layers.{layer}.attention_norm.weight"])
+            else:
+                layer_embedding_norm = wp.zeros(shape=(final_embedding.shape[0], final_embedding.shape[1]), dtype=WP_FLOAT32)
+                wp.launch(kernel=wpm.wp_rms_norm, dim=final_embedding.shape[0], inputs=[final_embedding, WP_FLOAT32(norm_eps), model[f"layers.{layer}.attention_norm.weight"], layer_embedding_norm])
 
             q_layer = model[f"layers.{layer}.attention.wq.weight"]
             head_dim = q_layer.shape[0] // n_heads
@@ -143,7 +125,10 @@ with pm.wp_profile_function("Warp Inference"):
                     mask = wp.full((layer_embedding_norm.shape[0], layer_embedding_norm.shape[0]), WP_FLOAT32(float("-inf")), dtype=WP_FLOAT32, device=DEVICE)
                     wp.launch(kernel=wpm.wp_triu, dim=mask.shape, inputs=[mask])
 
-                    qk_per_token_after_masking_after_softmax = wpm.wp_softmax(qk_per_token, mask)
+                    if args.tile:
+                        qk_per_token_after_masking_after_softmax = wpm.tiled_softmax(qk_per_token, mask)
+                    else:
+                        qk_per_token_after_masking_after_softmax = wpm.wp_softmax(qk_per_token, mask)
 
                     qkv_attention = wp.zeros(shape=(layer_embedding_norm.shape[0], v_per_token.shape[1]), dtype=WP_FLOAT32)
                     c = wp.zeros(shape=(layer_embedding_norm.shape[0], v_per_token.shape[1]), dtype=WP_FLOAT32)
@@ -195,7 +180,124 @@ with pm.wp_profile_function("Warp Inference"):
         max_logit = wp.zeros(shape=(1,), dtype=WP_FLOAT32)
         wp.launch(kernel=wpm.wp_argmax, dim=logits.shape[1], inputs=[logits, max_logit])
         wp.launch(kernel=wpm.wp_index, dim=logits.shape[1], inputs=[logits, max_logit, next_token])
-        print(tokenizer.decode([wp.to_torch(next_token).item()]))
+        # print(tokenizer.decode([wp.to_torch(next_token).item()]))
+    return wp.to_torch(next_token).item()
+
+# Main execution
+t1 = time.time()
+with pm.wp_profile_function("Warp Inference"):
+    tokenizer_path = "Meta-Llama-3-8B/tokenizer.model"
+    special_tokens = [
+        "<|begin_of_text|>",
+        "<|end_of_text|>",
+        "<|reserved_special_token_0|>",
+        "<|reserved_special_token_1|>",
+        "<|reserved_special_token_2|>",
+        "<|reserved_special_token_3|>",
+        "<|start_header_id|>",
+        "<|end_header_id|>",
+        "<|reserved_special_token_4|>",
+        "<|eot_id|>",  # end of turn
+    ] + [f"<|reserved_special_token_{i}|>" for i in range(5, 256 - 5)]
+
+    mergeable_ranks = load_tiktoken_bpe(tokenizer_path)
+    tokenizer = tiktoken.Encoding(
+        name=Path(tokenizer_path).name,
+        pat_str=r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+        mergeable_ranks=mergeable_ranks,
+        special_tokens={token: len(mergeable_ranks) + i for i, token in enumerate(special_tokens)},
+    )
+
+    with open("Meta-Llama-3-8B/params.json", "r") as f:
+        config = json.load(f)
+    
+    # Load model weights
+    model = torch.load("Meta-Llama-3-8B/consolidated.00.pth")
+    model = {k: wp.array(v.to(torch.float32), dtype=WP_FLOAT32) for k, v in model.items()}
+    
+    prompt = "the answer to the ultimate question of life, the universe, and everything is "
+    
+    # Make sure both versions use the same tokens
+    tokens_ = [128000] + tokenizer.encode(prompt)
+    tokens_ = torch.tensor(tokens_, dtype=torch.int32)
+    tokens = wp.from_torch(tokens_.to(DEVICE), dtype=WP_INT)
+
+    # Apply torch.compile to the inference function if requested
+    if args.compile:
+        print("Using torch.compile for full model inference")
+        compiled_inference = torch.compile(run_wp_inference, mode="max-autotune")
+        t_inference = time.time()
+        next_token = compiled_inference(tokens, model, config)
+        t_inference = time.time() - t_inference
+        print("Time taken for inference (torch.compile):", t_inference)
+        print("First token:", tokenizer.decode([next_token]))
+        
+        # Initialize sequence for continuous generation
+        generated_tokens_torch = tokens_.clone().to(DEVICE)
+        avg_time = 0
+        
+        for i in range(args.profile_iter):
+            # Convert to Warp array for inference
+            generated_tokens = wp.from_torch(generated_tokens_torch, dtype=WP_INT)
+            
+            # Use the growing sequence for next token prediction
+            t_inference = time.time()
+            next_token = compiled_inference(generated_tokens, model, config)
+            t_inference = time.time() - t_inference
+            avg_time += t_inference
+            
+            # Append the new token to our PyTorch sequence
+            next_token_tensor = torch.tensor([next_token], dtype=torch.int32).to(DEVICE)
+            generated_tokens_torch = torch.cat([generated_tokens_torch, next_token_tensor], dim=0)
+            
+            # Display information
+            token_text = tokenizer.decode([next_token])
+            # print(f"Iteration {i+1}: New token = '{token_text}', Time = {t_inference:.4f}s, Token ID = {next_token}")
+            
+            # Every 10 tokens, print the full text
+            if (i+1) % 10 == 0:
+                full_text = tokenizer.decode(generated_tokens_torch.cpu().tolist())
+                print(f"Full text so far: '{full_text}'")
+        
+        print("Average time taken for inference:", avg_time / args.profile_iter)
+    else:
+        t_inference = time.time()
+        next_token = run_wp_inference(tokens, model, config)
+        t_inference = time.time() - t_inference
+        print("Time taken for inference:", t_inference)
+        print("First token:", tokenizer.decode([next_token]))
+        
+        # Initialize with the prompt tokens (as PyTorch tensor)
+        generated_tokens_torch = tokens_.clone().to(DEVICE)
+        avg_time = 0
+        
+        for i in range(args.profile_iter):
+            # Convert to Warp array for inference
+            generated_tokens = wp.from_torch(generated_tokens_torch, dtype=WP_INT)
+            t_inference = time.time()
+            next_token = run_wp_inference(generated_tokens, model, config)
+            t_inference = time.time() - t_inference
+            avg_time += t_inference
+            
+            # Append the new token to our PyTorch sequence
+            next_token_tensor = torch.tensor([next_token], dtype=torch.int32).to(DEVICE)
+            generated_tokens_torch = torch.cat([generated_tokens_torch, next_token_tensor], dim=0)
+            
+            # Decode and print what we have so far
+            token_text = tokenizer.decode([next_token])
+            # print(f"Iteration {i+1}: New token = '{token_text}', Time = {t_inference:.4f}s, Token ID = {next_token}")
+            
+            # Every 10 tokens, print the full text
+            if (i+1) % 10 == 0:
+                full_text = tokenizer.decode(generated_tokens_torch.cpu().tolist())
+                print(f"Full text so far: '{full_text}'")
+        
+        print("Average time taken for inference:", avg_time / args.profile_iter)
+    
+    token_text = tokenizer.decode([next_token])
+    print("Next token:", token_text)
 
 t2 = time.time()
-print("Time taken: ", t2 - t1)
+print("Total time taken:", t2 - t1)
+if args.profile:
+    print(pm.prof.key_averages().table(row_limit=100))
