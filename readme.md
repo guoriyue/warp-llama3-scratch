@@ -13,7 +13,7 @@ torch_inference.py: for Torch library Llama3 inference.
 
 config.py: Define some warp data types.
 
-wp_module.py: Define some warp functions useful for Llama-3. But we probably need to refactor them.
+wp_kernels.py: Define some warp functions useful for Llama-3. But we probably need to refactor them.
 
 equivalence_check.py: Check the correctness of the float32 version of the warp code. Already passed! A lot of duplicate code, just for easier debugging.
 
@@ -42,4 +42,4 @@ Torch time taken : 10.623606204986572
 
 1. The precision problem (just use float32 now, but I think for llm we should use bf16)
 4. Profile the code (the result is really gooood, need to check again)
-5. Refactor wp_module.py for better support, maybe add other models in the future. llm / nerf / diffusion model
+5. Refactor wp_kernels.py for better support, maybe add other models in the future. llm / nerf / diffusion model

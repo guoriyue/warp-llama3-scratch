@@ -6,7 +6,7 @@ import json
 import matplotlib.pyplot as plt
 import numpy as np
 import warp as wp
-import wp_module as wpm
+import wp_kernels as wpm
 from config import *
 
 # DEVICE = 'cpu'
