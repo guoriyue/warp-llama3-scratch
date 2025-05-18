@@ -32,12 +32,6 @@ Remove cache dir (like tokenizer.model) if you get tokenization error:
 rm -rf /tmp/data-gym-cache
 ```
 
-## Profile
-
-Warp time taken : 10.25156021118164 
-
-Torch time taken : 10.623606204986572
-
 ## TODO
 
 1. The precision problem (just use float32 now, but I think for llm we should use bf16)
