@@ -34,9 +34,17 @@ rm -rf /tmp/data-gym-cache
 
 ## Profile
 
-Warp time taken : 10.25156021118164 
+| Implementation | Configuration | Time (s) |
+|----------------|---------------|----------|
+| Torch | Standard | 0.3053 |
+| Torch | Compile | 0.4146 |
+| Warp | No Tile, No Compile | 1.1500 |
+| Warp | No Tile, Compile | 1.1578 |
+| Warp | Tile, No Compile | 1.0648 |
+| Warp | Tile, Compile | 1.0689 |
 
-Torch time taken : 10.623606204986572
+
+The tiling optimization shows only small impact on performance, likely because our Warp kernels are already SIMT. The torch.compile results show a slight performance degradation, needs further investigation.
 
 ## TODO
 
