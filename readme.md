@@ -48,6 +48,5 @@ The tiling optimization shows only small impact on performance, likely because o
 
 ## TODO
 
-1. The precision problem (just use float32 now, but I think for llm we should use bf16)
-4. Profile the code (the result is really gooood, need to check again)
-5. Refactor wp_kernels.py for better support, maybe add other models in the future. llm / nerf / diffusion model
+1. Check how torch.compile works
+2. Refactor wp_kernels.py for better support, maybe add other models in the future. llm / nerf / diffusion model
